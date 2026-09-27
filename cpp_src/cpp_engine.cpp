@@ -20,6 +20,7 @@
 #include <future>
 #include <chrono>
 #include <numeric>
+#include <atomic>
 
 #if defined(_WIN32) || defined(_WIN64)
 #define EXPORT_API __declspec(dllexport)
@@ -345,6 +346,19 @@ struct CountryTargetIndex {
     std::unordered_map<std::string, std::vector<uint32_t>> exact_name_map_s3;
     std::unordered_map<std::string, std::vector<uint32_t>> token_inverted_index_s2;
     std::unordered_map<std::string, std::vector<uint32_t>> token_inverted_index_s3;
+    // Frequency tables are built in a first pass.  We only retain rare name
+    // tokens in the inverted index; capping a posting list by input order can
+    // silently discard the true match on the full challenge data.
+    std::unordered_map<std::string, size_t> token_frequency_s2;
+    std::unordered_map<std::string, size_t> token_frequency_s3;
+    std::unordered_set<std::string> query_root_names;
+    std::unordered_set<std::string> query_tokens;
+    std::unordered_set<std::string> query_postal_codes;
+    std::unordered_set<uint32_t> query_address_hashes;
+    std::unordered_map<std::string, std::vector<uint32_t>> postal_index_s2;
+    std::unordered_map<std::string, std::vector<uint32_t>> postal_index_s3;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> address_hash_index_s2;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> address_hash_index_s3;
 };
 
 // Resolution rules configuration
@@ -362,7 +376,8 @@ struct ResolutionRules {
     double weight_street = 0.20;
     double weight_postal = 0.15;
     size_t max_candidates_per_entity = 10; // Compact candidate set for final ranking boost
-    size_t max_posting_list_size = 35;
+    size_t max_matches_per_entity = 12; // Ground truth contains up to 11 links/entity
+    size_t max_posting_list_size = 1000; // Rare-token frequency cutoff, not input-order cap
     size_t max_exact_posting_size = 50;
     int num_threads = 8;
 };
@@ -604,6 +619,12 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
         int max_cands = (int)rules.max_candidates_per_entity;
         parse_int("\"max_candidates_per_entity\"", max_cands);
         if (max_cands > 0) rules.max_candidates_per_entity = (size_t)max_cands;
+        int max_matches = (int)rules.max_matches_per_entity;
+        parse_int("\"max_matches_per_entity\"", max_matches);
+        if (max_matches > 0) rules.max_matches_per_entity = (size_t)max_matches;
+        int max_posting = (int)rules.max_posting_list_size;
+        parse_int("\"max_posting_list_size\"", max_posting);
+        if (max_posting > 0) rules.max_posting_list_size = (size_t)max_posting;
     }
 
     int hw_threads = (int)std::thread::hardware_concurrency();
@@ -659,17 +680,26 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
     s1_file.close();
 
     size_t total_s1 = s1_records.size();
+    std::cerr << "[C++ pipeline] Stage 1/5 complete: normalized " << total_s1
+              << " incoming records" << std::endl;
 
     // Results storage: S1 index -> candidate IDs and matched IDs
     std::vector<std::vector<std::string>> s1_candidates(total_s1);
     std::vector<std::vector<std::string>> s1_matches(total_s1);
 
-    // Step 2: Index S2 and S3 in a SINGLE PASS into country-partitioned indexes
+    // Step 2a: Count name-token frequencies before building postings.  The old
+    // implementation kept the first N rows for every token, which created a
+    // severe order bias on the 5M-row target sources.
     std::unordered_map<std::string, CountryTargetIndex> country_target_indices;
+    std::unordered_map<std::string, size_t> target_records_by_country;
     size_t total_s2 = 0;
     size_t total_s3 = 0;
-    for (const auto& cp : s1_by_country) {
-        country_target_indices[cp.first].records.reserve(1000000);
+    for (const auto& s1 : s1_records) {
+        auto& query = country_target_indices[s1.country];
+        if (!s1.root_name.empty()) query.query_root_names.insert(s1.root_name);
+        for (const auto& tok : s1.tokens) query.query_tokens.insert(tok);
+        if (!s1.postal_code.empty()) query.query_postal_codes.insert(s1.postal_code);
+        for (uint32_t h : s1.addr_hashes) query.query_address_hashes.insert(h);
     }
 
     for (const char* target_path : {s2_tsv_path, s3_tsv_path}) {
@@ -693,13 +723,67 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
             std::string c_norm = normalize_country_cpp_internal(raw_c);
             auto c_it = country_target_indices.find(c_norm);
             if (c_it == country_target_indices.end()) continue;
+            ++target_records_by_country[c_norm];
 
             CountryTargetIndex& target_index = c_it->second;
 
+            std::string_view raw_name = (fields.size() > 1) ? fields[1] : "";
+            std::string clean_name = normalize_text_cpp_internal(raw_name);
+            auto [root_name, _] = parse_legal_suffix_cpp_internal(clean_name);
+            std::vector<std::string> tokens = extract_tokens_cpp_internal(root_name);
+            auto& frequencies = (src_type == 2) ? target_index.token_frequency_s2 : target_index.token_frequency_s3;
+            for (const auto& tok : tokens) {
+                if (target_index.query_tokens.find(tok) != target_index.query_tokens.end()) {
+                    ++frequencies[tok];
+                }
+            }
+        }
+        tgt_file.close();
+    }
+
+    // Use bounded country-partition reservations.  The old fixed one-million-
+    // row reservation per country created large unused allocations and
+    // increased memory pressure before scoring began.
+    for (const auto& cp : s1_by_country) {
+        auto count_it = target_records_by_country.find(cp.first);
+        if (count_it != target_records_by_country.end()) {
+            // The final index keeps only rows with at least one query key, so
+            // the raw country count is an upper bound.  Use a bounded warm
+            // reserve to avoid both giant allocations and repeated growth.
+            country_target_indices[cp.first].records.reserve(
+                std::min<size_t>(count_it->second, 250000)
+            );
+        }
+    }
+
+    std::cerr << "[C++ pipeline] Stage 2/5 complete: counted target blocking-key frequencies"
+              << " (S2=" << total_s2 << ", S3=" << total_s3 << ")" << std::endl;
+
+    // Step 2b: Index S2 and S3 in a second pass.  Rare tokens are retained in
+    // full, so a matching record is never lost merely because it appears late
+    // in a source file.  Address keys provide a second route for DBA/rebrand
+    // records whose names share no token with Source 1.
+    for (const char* target_path : {s2_tsv_path, s3_tsv_path}) {
+        uint8_t src_type = (std::strcmp(target_path, s2_tsv_path) == 0) ? 2 : 3;
+        std::ifstream tgt_file(target_path);
+        if (!tgt_file.is_open()) continue;
+
+        std::string t_line;
+        std::getline(tgt_file, t_line); // Skip header
+        while (std::getline(tgt_file, t_line)) {
+            if (t_line.empty()) continue;
+            split_tsv_fields(t_line, fields);
+            if (fields.empty()) continue;
+
+            std::string_view raw_c = (fields.size() > 3) ? fields[3] : "UNKNOWN";
+            std::string c_norm = normalize_country_cpp_internal(raw_c);
+            auto c_it = country_target_indices.find(c_norm);
+            if (c_it == country_target_indices.end()) continue;
+
+            CountryTargetIndex& target_index = c_it->second;
             std::string id = std::string(fields[0]);
             std::string_view raw_name = (fields.size() > 1) ? fields[1] : "";
             std::string_view raw_addr = (fields.size() > 2) ? fields[2] : "";
-
             std::string clean_name = normalize_text_cpp_internal(raw_name);
             auto [root_name, _] = parse_legal_suffix_cpp_internal(clean_name);
             std::string acronym = extract_acronym_cpp_internal(root_name);
@@ -709,38 +793,63 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
             std::string postal = extract_postal_code_cpp_internal(clean_addr);
             std::vector<uint32_t> addr_hashes = extract_address_token_hashes_cpp_internal(clean_addr);
 
+            auto& frequencies = (src_type == 2) ? target_index.token_frequency_s2 : target_index.token_frequency_s3;
+
+            bool has_exact_name_key = !root_name.empty() &&
+                target_index.query_root_names.find(root_name) != target_index.query_root_names.end();
+            bool has_token_key = false;
+            for (const auto& tok : tokens) {
+                auto freq_it = frequencies.find(tok);
+                if (target_index.query_tokens.find(tok) != target_index.query_tokens.end() &&
+                    freq_it != frequencies.end() && freq_it->second <= rules.max_posting_list_size) {
+                    has_token_key = true;
+                    break;
+                }
+            }
+            bool has_postal_key = !postal.empty() &&
+                target_index.query_postal_codes.find(postal) != target_index.query_postal_codes.end();
+            bool has_address_key = false;
+            for (uint32_t h : addr_hashes) {
+                if (target_index.query_address_hashes.find(h) != target_index.query_address_hashes.end()) {
+                    has_address_key = true;
+                    break;
+                }
+            }
+
+            // The scorer can only reach a target through one of these blocking
+            // routes.  Do not retain millions of unreachable target records.
+            if (!has_exact_name_key && !has_token_key && !has_postal_key && !has_address_key) {
+                continue;
+            }
+
             uint32_t rec_idx = (uint32_t)target_index.records.size();
 
-            if (src_type == 2) {
-                // S2 exact root name index
-                if (!root_name.empty()) {
-                    auto& list = target_index.exact_name_map_s2[root_name];
-                    if (list.size() < rules.max_exact_posting_size) {
-                        list.push_back(rec_idx);
-                    }
+            // Exact roots are high-signal. Keep all of them unless the name is
+            // genuinely generic; the token frequency filter below handles the
+            // latter without arbitrary row-order truncation.
+            if (has_exact_name_key) {
+                auto& list = (src_type == 2) ? target_index.exact_name_map_s2[root_name] : target_index.exact_name_map_s3[root_name];
+                if (list.size() < std::max<size_t>(rules.max_exact_posting_size, 500)) {
+                    list.push_back(rec_idx);
                 }
-                // S2 inverted token index
-                for (const auto& tok : tokens) {
-                    auto& post = target_index.token_inverted_index_s2[tok];
-                    if (post.size() < rules.max_posting_list_size) {
-                        post.push_back(rec_idx);
-                    }
+            }
+            for (const auto& tok : tokens) {
+                auto freq_it = frequencies.find(tok);
+                if (target_index.query_tokens.find(tok) != target_index.query_tokens.end() &&
+                    freq_it != frequencies.end() && freq_it->second <= rules.max_posting_list_size) {
+                    auto& post = (src_type == 2) ? target_index.token_inverted_index_s2[tok] : target_index.token_inverted_index_s3[tok];
+                    post.push_back(rec_idx);
                 }
-            } else {
-                // S3 exact root name index
-                if (!root_name.empty()) {
-                    auto& list = target_index.exact_name_map_s3[root_name];
-                    if (list.size() < rules.max_exact_posting_size) {
-                        list.push_back(rec_idx);
-                    }
-                }
-                // S3 inverted token index
-                for (const auto& tok : tokens) {
-                    auto& post = target_index.token_inverted_index_s3[tok];
-                    if (post.size() < rules.max_posting_list_size) {
-                        post.push_back(rec_idx);
-                    }
-                }
+            }
+            if (!postal.empty() && target_index.query_postal_codes.find(postal) != target_index.query_postal_codes.end()) {
+                auto& post = (src_type == 2) ? target_index.postal_index_s2[postal] : target_index.postal_index_s3[postal];
+                if (post.size() < 2000) post.push_back(rec_idx);
+            }
+            auto& address_index = (src_type == 2) ? target_index.address_hash_index_s2 : target_index.address_hash_index_s3;
+            for (uint32_t h : addr_hashes) {
+                if (target_index.query_address_hashes.find(h) == target_index.query_address_hashes.end()) continue;
+                auto& post = address_index[h];
+                if (post.size() < 1000) post.push_back(rec_idx);
             }
 
             target_index.records.push_back({std::move(id), std::move(root_name), std::move(acronym), std::move(tokens), std::move(street_nums), std::move(postal), std::move(addr_hashes), src_type});
@@ -748,7 +857,18 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
         tgt_file.close();
     }
 
+    size_t indexed_target_records = 0;
+    for (const auto& entry : country_target_indices) {
+        indexed_target_records += entry.second.records.size();
+    }
+    std::cerr << "[C++ pipeline] Stage 3/5 complete: built country-partitioned candidate indexes"
+              << " (retained " << indexed_target_records << " keyed target records)"
+              << std::endl;
+
     // Step 3: Multi-threaded matching of S1 records per country
+    std::atomic<size_t> processed_s1{0};
+    std::cerr << "[C++ pipeline] Stage 4/5 started: candidate sieve, fuzzy scoring, and resolution"
+              << std::endl;
     for (const auto& cp : s1_by_country) {
         const std::string& country = cp.first;
         const std::vector<size_t>& s1_indices = cp.second;
@@ -793,9 +913,26 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                     // ========================================================
                     // 1. Search Source 2 Candidates
                     // ========================================================
-                    // ========================================================
-                    // 1. Search Source 2 Candidates
-                    // ========================================================
+                    // Address keys are an independent retrieval route for
+                    // rebrands/DBAs whose names have no shared token.
+                    if (!s1.postal_code.empty()) {
+                        auto it = target_index.postal_index_s2.find(s1.postal_code);
+                        if (it != target_index.postal_index_s2.end()) {
+                            for (uint32_t tid : it->second) {
+                                if (overlap_counts[tid] == 0) touched_s2.push_back(tid);
+                                if (overlap_counts[tid] == 0) overlap_counts[tid] = -1;
+                            }
+                        }
+                    }
+                    for (uint32_t h : s1.addr_hashes) {
+                        auto it = target_index.address_hash_index_s2.find(h);
+                        if (it != target_index.address_hash_index_s2.end()) {
+                            for (uint32_t tid : it->second) {
+                                if (overlap_counts[tid] == 0) touched_s2.push_back(tid);
+                                if (overlap_counts[tid] == 0) overlap_counts[tid] = -1;
+                            }
+                        }
+                    }
                     if (!s1.root_name.empty()) {
                         auto it = target_index.exact_name_map_s2.find(s1.root_name);
                         if (it != target_index.exact_name_map_s2.end()) {
@@ -812,6 +949,8 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                                 if (overlap_counts[tid] == 0) {
                                     touched_s2.push_back(tid);
                                     overlap_counts[tid] = 1;
+                                } else if (overlap_counts[tid] == -1) {
+                                    overlap_counts[tid] = 1;
                                 } else if (overlap_counts[tid] > 0 && overlap_counts[tid] < 9900) {
                                     overlap_counts[tid]++;
                                 }
@@ -821,22 +960,23 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
 
                     // Lambda for computing rich multi-field score between s1 and target
                     auto compute_score = [&](const S1Record& s1_rec, const TargetRecord& target, int overlap) -> double {
+                        int name_overlap = std::max(0, overlap);
+                        size_t name_union_size = s1_rec.tokens.size() + target.tokens.size() - name_overlap;
+                        double name_jaccard = (name_union_size > 0) ? ((double)name_overlap / (double)name_union_size) : 0.0;
+                        double name_jw = fast_jaro_winkler(s1_rec.root_name.c_str(), target.root_name.c_str());
                         double base_name = 0.0;
                         if (overlap >= 9999 || (!s1_rec.root_name.empty() && s1_rec.root_name == target.root_name)) {
                             base_name = 1.0;
                         } else {
-                            size_t union_size = s1_rec.tokens.size() + target.tokens.size() - overlap;
-                            double jaccard = (union_size > 0) ? ((double)overlap / (double)union_size) : 0.0;
-                            double jw = 0.0;
-                            if (jaccard >= 0.20 || overlap >= 1) {
-                                jw = fast_jaro_winkler(s1_rec.root_name.c_str(), target.root_name.c_str());
-                            }
-                            if (jaccard >= 0.75 || jw >= 0.92) {
-                                base_name = std::max(jaccard, jw);
-                            } else if (jaccard >= 0.50 || jw >= 0.85) {
-                                base_name = 0.40 * jaccard + 0.60 * jw;
+                            // Address-retrieved pairs must still receive a
+                            // character-level name signal; the previous code
+                            // forced JW to zero when no name token overlapped.
+                            if (name_jaccard >= 0.75 || name_jw >= 0.92) {
+                                base_name = std::max(name_jaccard, name_jw);
+                            } else if (name_jaccard >= 0.50 || name_jw >= 0.85) {
+                                base_name = 0.40 * name_jaccard + 0.60 * name_jw;
                             } else {
-                                base_name = 0.35 * std::max(jaccard, jw);
+                                base_name = 0.35 * std::max(name_jaccard, name_jw);
                             }
                         }
 
@@ -875,6 +1015,9 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             }
                         }
 
+                        size_t addr_union = s1_rec.addr_hashes.size() + target.addr_hashes.size() - (size_t)addr_overlap;
+                        double addr_jaccard = (addr_union > 0) ? ((double)addr_overlap / (double)addr_union) : 0.0;
+
                         // Missing Address Indicator: check if either record lacks address data
                         bool s1_has_addr = !s1_rec.street_nums.empty() || !s1_rec.postal_code.empty() || !s1_rec.addr_hashes.empty();
                         bool tgt_has_addr = !target.street_nums.empty() || !target.postal_code.empty() || !target.addr_hashes.empty();
@@ -907,6 +1050,20 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             score -= 0.35;
                         }
 
+                        // Full-density validation showed that exact/common
+                        // business names are not safe by themselves.  Require
+                        // both a meaningful address agreement and a strong
+                        // name signal for a production match.  This preserves
+                        // DBA/rebrand links while rejecting same-name entities
+                        // at different locations.
+                        bool address_consistent = addr_jaccard >= 0.30 && postal_agree >= 0 && sn_agree >= 0;
+                        bool name_consistent = name_jw >= 0.90 || name_jaccard >= 0.40 || base_name >= 0.98;
+                        if (address_consistent && name_consistent) {
+                            score = std::max(score, 0.84);
+                        } else {
+                            score = std::min(score, 0.78);
+                        }
+
                         return std::max(0.0, std::min(1.0, score));
                     };
 
@@ -926,6 +1083,24 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                     // ========================================================
                     // 2. Search Source 3 Candidates
                     // ========================================================
+                    if (!s1.postal_code.empty()) {
+                        auto it = target_index.postal_index_s3.find(s1.postal_code);
+                        if (it != target_index.postal_index_s3.end()) {
+                            for (uint32_t tid : it->second) {
+                                if (overlap_counts[tid] == 0) touched_s3.push_back(tid);
+                                if (overlap_counts[tid] == 0) overlap_counts[tid] = -1;
+                            }
+                        }
+                    }
+                    for (uint32_t h : s1.addr_hashes) {
+                        auto it = target_index.address_hash_index_s3.find(h);
+                        if (it != target_index.address_hash_index_s3.end()) {
+                            for (uint32_t tid : it->second) {
+                                if (overlap_counts[tid] == 0) touched_s3.push_back(tid);
+                                if (overlap_counts[tid] == 0) overlap_counts[tid] = -1;
+                            }
+                        }
+                    }
                     if (!s1.root_name.empty()) {
                         auto it = target_index.exact_name_map_s3.find(s1.root_name);
                         if (it != target_index.exact_name_map_s3.end()) {
@@ -941,6 +1116,8 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             for (uint32_t tid : it->second) {
                                 if (overlap_counts[tid] == 0) {
                                     touched_s3.push_back(tid);
+                                    overlap_counts[tid] = 1;
+                                } else if (overlap_counts[tid] == -1) {
                                     overlap_counts[tid] = 1;
                                 } else if (overlap_counts[tid] > 0 && overlap_counts[tid] < 9900) {
                                     overlap_counts[tid]++;
@@ -1096,16 +1273,20 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                     std::vector<std::string> s3_matches;
                     std::unordered_set<uint32_t> match_tids;
 
+                    size_t s2_match_count = 0;
                     for (const auto& sc : s2_scores) {
                         if (sc.second >= rules.match_threshold) {
                             s2_matches.push_back(target_index.records[sc.first].id);
                             match_tids.insert(sc.first);
+                            if (++s2_match_count >= rules.max_matches_per_entity) break;
                         }
                     }
+                    size_t s3_match_count = 0;
                     for (const auto& sc : s3_scores) {
                         if (sc.second >= rules.match_threshold) {
                             s3_matches.push_back(target_index.records[sc.first].id);
                             match_tids.insert(sc.first);
+                            if (++s3_match_count >= rules.max_matches_per_entity) break;
                         }
                     }
 
@@ -1163,6 +1344,12 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
 
                     s1_candidates[s1_idx] = std::move(cands);
                     s1_matches[s1_idx] = std::move(matches);
+
+                    size_t completed = processed_s1.fetch_add(1) + 1;
+                    if (completed % 100000 == 0 || completed == total_s1) {
+                        std::cerr << "[C++ pipeline] Resolved " << completed << "/"
+                                  << total_s1 << " incoming records" << std::endl;
+                    }
                 }
             });
         }
@@ -1172,7 +1359,11 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
         }
     }
 
-    // Step 3: Stream Serializing to Output TSVs in Strictly Sorted S1 Order
+    std::cerr << "[C++ pipeline] Stage 4/5 complete: resolved all incoming records"
+              << std::endl;
+    // Step 5: Stream serializing to output TSVs in strictly sorted S1 order
+    std::cerr << "[C++ pipeline] Stage 5/5 started: writing candidate and match TSVs"
+              << std::endl;
     std::ofstream cand_out(candidate_output_path);
     std::ofstream match_out(matching_output_path);
 
@@ -1227,6 +1418,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
 
     cand_out.close();
     match_out.close();
+    std::cerr << "[C++ pipeline] Stage 5/5 complete: output files written" << std::endl;
 
     auto t_end = std::chrono::steady_clock::now();
     double elapsed_sec = std::chrono::duration<double>(t_end - t_start).count();

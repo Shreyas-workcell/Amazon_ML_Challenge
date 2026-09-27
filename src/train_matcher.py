@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 
 try:
     from .config import DEFAULT_CONFIG, TrainConfig
@@ -218,24 +218,47 @@ class MatcherTrainer:
             return model, self.config.default_threshold, 1.0
 
         # K-Fold Out-of-Fold prediction for threshold search
-        n_splits = min(self.config.n_splits, max(2, len(X) // 4))
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.config.seed)
-        oof_probs = np.zeros(len(X), dtype=np.float32)
+        # Keep every pair from one S1 entity in the same fold.  Pair-level
+        # K-fold leaks the entity's positive/negative signature across folds
+        # and makes the threshold look substantially better than it is on new
+        # reference entities.
+        n_groups = pairs_df["source1_entity_id"].nunique()
+        # Grouped CV is the correct validation strategy for the real challenge,
+        # but it is undefined for tiny fixtures (a fold can contain one row or
+        # only one class).  Use an in-sample calibration fallback only there;
+        # production-sized training still always takes the grouped-CV path.
+        use_grouped_cv = n_groups >= 4 and len(X) >= 8
+        if use_grouped_cv:
+            n_splits = min(self.config.n_splits, max(2, n_groups // 4))
+            kf = GroupKFold(n_splits=n_splits)
+            oof_probs = np.zeros(len(X), dtype=np.float32)
+            groups = pairs_df["source1_entity_id"].to_numpy()
+            try:
+                for fold, (train_idx, val_idx) in enumerate(kf.split(X, y, groups=groups)):
+                    fold_model = MatcherModel(self.config.lgb_params)
+                    fold_model.fit(X[train_idx], y[train_idx])
+                    oof_probs[val_idx] = fold_model.predict_proba(X[val_idx])
 
-        for fold, (train_idx, val_idx) in enumerate(kf.split(X, y)):
-            fold_model = MatcherModel(self.config.lgb_params)
-            fold_model.fit(X[train_idx], y[train_idx])
-            oof_probs[val_idx] = fold_model.predict_proba(X[val_idx])
+                # Optimize threshold on out-of-fold probabilities.
+                best_threshold, best_f05 = ThresholdOptimizer.find_optimal_threshold(
+                    pairs_df, oof_probs, ground_truth, self.config
+                )
+            except ValueError as exc:
+                logger.warning("Grouped CV skipped for undersized/degenerate data: %s", exc)
+                use_grouped_cv = False
 
-        # Optimize threshold on out-of-fold probabilities
-        best_threshold, best_f05 = ThresholdOptimizer.find_optimal_threshold(
-            pairs_df, oof_probs, ground_truth, self.config
-        )
-
-        # Train final model on full training set
+        # Train final model on full training set. For tiny fixtures where a
+        # valid grouped split is impossible, calibrate on the fitted model so
+        # the normal pipeline remains functional without weakening production
+        # validation.
         logger.info("Fitting final discriminator model on full dataset...")
         final_model = MatcherModel(self.config.lgb_params)
         final_model.fit(X, y)
+        if not use_grouped_cv:
+            in_sample_probs = final_model.predict_proba(X)
+            best_threshold, best_f05 = ThresholdOptimizer.find_optimal_threshold(
+                pairs_df, in_sample_probs, ground_truth, self.config
+            )
 
         # Save artifacts
         model_path = DEFAULT_CONFIG.paths.lgb_model_file

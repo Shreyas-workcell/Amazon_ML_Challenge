@@ -178,6 +178,19 @@ class CountryPartitionedBlocker:
                 for matched_t_id in postal_index[post_code][:15]:
                     candidates[s1_id].add(matched_t_id)
 
+        # 1b. Exact normalized phone index. Phone agreement is a strong,
+        # inexpensive signal and should reach scoring even when names are noisy.
+        phone_index = defaultdict(list)
+        for t_idx, phone_digits in enumerate(target_df["phone_digits"]):
+            if phone_digits and len(phone_digits) >= 7:
+                phone_index[phone_digits].append(target_ids[t_idx])
+
+        for s_idx, phone_digits in enumerate(s1_df["phone_digits"]):
+            s1_id = s1_ids[s_idx]
+            if phone_digits and len(phone_digits) >= 7:
+                for matched_t_id in phone_index.get(phone_digits, []):
+                    candidates[s1_id].add(matched_t_id)
+
         # 2. Token-level inverted index on root names
         token_index = defaultdict(list)
         for t_idx, root_name in enumerate(target_df["root_name"]):
@@ -192,7 +205,9 @@ class CountryPartitionedBlocker:
             shared_counts = defaultdict(int)
             for tok in tokens:
                 if len(tok) >= 3 and tok in token_index:
-                    for t_id in token_index[tok][:50]:  # Cap inverted posting list lookup
+                    # Count every posting before ranking. Truncating a posting list
+                    # by input order can discard a true match arbitrarily.
+                    for t_id in token_index[tok]:
                         shared_counts[t_id] += 1
             # Add targets sharing >= 1 significant tokens
             sorted_by_overlap = sorted(shared_counts.items(), key=lambda x: x[1], reverse=True)
@@ -246,6 +261,19 @@ class CountryPartitionedBlocker:
         if s1_df.empty or target_df.empty:
             return candidates
 
+        # The optional transformer is not available in the challenge runtime,
+        # so the fallback below would build a dense TF-IDF/SVD matrix.  That is
+        # quadratic-ish in memory/time and becomes impractical for the full
+        # 200k-record training target pool.  Lexical blocking already supplies
+        # postal, phone, token, and character-ngram candidates; skip only the
+        # dense fallback for oversized partitions.
+        if self.dense_encoder is None and len(target_df) > 50_000:
+            logger.info(
+                "Skipping dense SVD fallback for oversized partition (%d targets)",
+                len(target_df),
+            )
+            return candidates
+
         target_ids = target_df["entity_id"].tolist()
         s1_ids = s1_df["entity_id"].tolist()
 
@@ -271,6 +299,91 @@ class CountryPartitionedBlocker:
             logger.warning("Dense vector blocking failed (%s)", e)
 
         return candidates
+
+    @staticmethod
+    def _blocking_evidence_score(source: Dict[str, object], target: Dict[str, object]) -> float:
+        """Score cheap blocking evidence before expensive fuzzy features.
+
+        This is deliberately not the match score.  It only ranks the small
+        candidate sieve and is deterministic, explainable, and independent of
+        the trained discriminator.
+        """
+        score = 0.0
+
+        source_phone = str(source.get("phone_digits", "") or "")
+        target_phone = str(target.get("phone_digits", "") or "")
+        if source_phone and target_phone and source_phone == target_phone:
+            score += 100.0
+
+        source_postal = str(source.get("postal_code", "") or "")
+        target_postal = str(target.get("postal_code", "") or "")
+        if source_postal and target_postal:
+            if source_postal == target_postal:
+                score += 80.0
+            elif len(source_postal) >= 3 and source_postal[:3] == target_postal[:3]:
+                score += 15.0
+
+        source_root = str(source.get("root_name", "") or "")
+        target_root = str(target.get("root_name", "") or "")
+        source_name_tokens = set(source_root.split())
+        target_name_tokens = set(target_root.split())
+        shared_name = source_name_tokens.intersection(target_name_tokens)
+        if source_root and source_root == target_root:
+            score += 70.0
+        score += min(30.0, 10.0 * len(shared_name))
+
+        source_numbers = set(source.get("street_numbers", []) or [])
+        target_numbers = set(target.get("street_numbers", []) or [])
+        if source_numbers and target_numbers:
+            score += 25.0 if source_numbers.intersection(target_numbers) else -20.0
+
+        source_address = set(str(source.get("clean_address", "") or "").split())
+        target_address = set(str(target.get("clean_address", "") or "").split())
+        source_address = {t for t in source_address if len(t) >= 3}
+        target_address = {t for t in target_address if len(t) >= 3}
+        if source_address and target_address:
+            union = source_address.union(target_address)
+            score += 35.0 * len(source_address.intersection(target_address)) / len(union)
+
+        if str(source.get("city", "") or "") and source.get("city") == target.get("city"):
+            score += 8.0
+        if str(source.get("state", "") or "") and source.get("state") == target.get("state"):
+            score += 4.0
+
+        # Every candidate already passed at least one blocking route.  This
+        # small floor keeps a dense-only candidate eligible for fuzzy scoring.
+        return score + 1.0
+
+    def _candidate_sieve(
+        self,
+        s1_df: pd.DataFrame,
+        target_df: pd.DataFrame,
+        all_candidates: Dict[str, Set[str]],
+    ) -> Tuple[Dict[str, List[str]], List[Dict[str, str]]]:
+        """Rank and cap candidates using blocking evidence, never row order."""
+        s1_lookup = s1_df.set_index("entity_id").to_dict("index")
+        target_lookup = target_df.set_index("entity_id").to_dict("index")
+        final_candidate_dict: Dict[str, List[str]] = {}
+        pairs_list: List[Dict[str, str]] = []
+
+        for s1_id, cand_set in all_candidates.items():
+            source = s1_lookup.get(s1_id, {})
+            ranked = []
+            for cand_id in cand_set:
+                target = target_lookup.get(cand_id)
+                if target is None:
+                    continue
+                ranked.append((self._blocking_evidence_score(source, target), cand_id))
+
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+            selected = [cand_id for _, cand_id in ranked[:self.config.max_candidates_per_entity]]
+            final_candidate_dict[s1_id] = selected
+            pairs_list.extend(
+                {"source1_entity_id": s1_id, "candidate_entity_id": cand_id}
+                for cand_id in selected
+            )
+
+        return final_candidate_dict, pairs_list
 
     def generate_candidates(
         self,
@@ -333,32 +446,10 @@ class CountryPartitionedBlocker:
                 combined = lex_cands[s1_id].union(dense_cands[s1_id])
                 all_candidates[s1_id].update(combined)
 
-        # Cap candidates per S1 entity to avoid combinatorial explosion
-        final_candidate_dict: Dict[str, List[str]] = {}
-        pairs_list: List[Dict[str, str]] = []
-
-        half_cap = max(10, self.config.max_candidates_per_entity // 2)
-        for s1_id, cand_set in all_candidates.items():
-            s2_cands = [c for c in cand_set if c.startswith("S2-") or c.startswith("s2-")]
-            s3_cands = [c for c in cand_set if c.startswith("S3-") or c.startswith("s3-")]
-
-            selected_s2 = s2_cands[:half_cap]
-            selected_s3 = s3_cands[:half_cap]
-
-            remaining = self.config.max_candidates_per_entity - (len(selected_s2) + len(selected_s3))
-            if remaining > 0:
-                if len(s2_cands) > len(selected_s2):
-                    selected_s2.extend(s2_cands[half_cap:half_cap + remaining])
-                elif len(s3_cands) > len(selected_s3):
-                    selected_s3.extend(s3_cands[half_cap:half_cap + remaining])
-
-            capped_cands = selected_s2 + selected_s3
-            final_candidate_dict[s1_id] = capped_cands
-            for cand_id in capped_cands:
-                pairs_list.append({
-                    "source1_entity_id": s1_id,
-                    "candidate_entity_id": cand_id
-                })
+        # Candidate sieve: rank by cheap key evidence before fuzzy features.
+        final_candidate_dict, pairs_list = self._candidate_sieve(
+            s1_df, target_df, all_candidates
+        )
 
         candidate_pairs_df = pd.DataFrame(pairs_list)
         if candidate_pairs_df.empty:

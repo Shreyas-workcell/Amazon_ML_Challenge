@@ -83,9 +83,9 @@ class ColumnMapping:
 @dataclass
 class BlockingConfig:
     """Hyperparameters for country-partitioned lexical and dense candidate retrieval."""
-    lexical_top_k: int = 35
-    dense_top_k: int = 25
-    max_candidates_per_entity: int = 50
+    lexical_top_k: int = 60
+    dense_top_k: int = 40
+    max_candidates_per_entity: int = 100
     dense_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     dense_dim: int = 384
     tfidf_ngram_range: Tuple[int, int] = (2, 4)

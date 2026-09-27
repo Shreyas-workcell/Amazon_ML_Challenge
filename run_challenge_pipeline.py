@@ -174,7 +174,7 @@ def main() -> None:
                 phase4_config = saved_cfg.get("exec_config", {})
         if not phase4_config:
             phase4_config = {
-                "match_threshold": round(optimal_threshold, 3),
+                "match_threshold": max(0.80, round(optimal_threshold, 3)),
                 "min_candidate_score": 0.35,
                 "street_num_bonus": 0.15,
                 "street_num_penalty": -0.35,
@@ -182,7 +182,9 @@ def main() -> None:
                 "postal_penalty": -0.35,
                 "addr_bonus": 0.15,
                 "addr_penalty": -0.35,
-                "max_candidates_per_entity": 10,
+                "max_candidates_per_entity": 30,
+                "max_matches_per_entity": 12,
+                "max_posting_list_size": 1000,
                 "num_threads": args.threads
             }
 
@@ -309,6 +311,7 @@ def main() -> None:
         ("singleton_rate_window", "SAFE" if 5.0 <= singleton_pct <= 7.0 else "WARNING", "Singleton Analysis", "Safe window [5.0% - 7.0%]"),
         ("decision_threshold", f"{phase2_config['match_threshold']:.3f}", "Model Configuration", "Optimal Macro-F0.5 threshold"),
         ("validation_macro_f05", f"{train_summary.get('macro_f05', 0.0):.4f}", "Validation Metrics", "Validation Macro-F0.5 (beta=0.5)"),
+        ("native_validation_macro_f05", f"{train_summary.get('native_macro_f05_val', 0.0):.4f}", "Validation Metrics", "C++ production scorer Macro-F0.5 (beta=0.5)"),
         ("validation_singleton_accuracy", f"{train_summary.get('singleton_accuracy', 0.0):.2f}%", "Validation Metrics", "Singleton classification accuracy"),
         ("target_blocking_recall", f"{target_blocking_recall:.2f}%" if target_blocking_recall > 0 else "N/A", "Validation Metrics", "Candidate blocking recall ceiling"),
         ("validation_submission_check", "PASS", "Submission Validation", "100% compliant with validate_submission.py"),

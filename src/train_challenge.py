@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -29,23 +30,81 @@ np.random.seed(42)
 
 from src.blocking import CountryPartitionedBlocker
 from src.config import DEFAULT_CONFIG
+from src.cpp_bridge import CPPEngine
 from src.features import PairFeatureExtractor
 from src.graph_resolver import TripartiteGraphResolver
 from src.preprocess import RecordPreprocessor
 from src.train_matcher import MatcherModel, MatcherTrainer, ThresholdOptimizer
-from src.utils import compute_entity_f05, compute_macro_f05, setup_logger
+from src.utils import compute_entity_f05, compute_macro_f05, load_tsv_mapping, setup_logger
 
 logger = setup_logger("train_challenge")
+
+
+def calibrate_cpp_rules(
+    s1_df: pd.DataFrame,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    ground_truth: Dict[str, Set[str]],
+    candidate_configs: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Select native scoring rules against labeled records and the official metric."""
+    if not CPPEngine.is_available() or s1_df.empty:
+        return {}
+
+    best_result: Dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="cpp_calibration_") as temp_dir:
+        temp_path = Path(temp_dir)
+        s1_path = temp_path / "test_source1.tsv"
+        s2_path = temp_path / "test_source2.tsv"
+        s3_path = temp_path / "test_source3.tsv"
+        s1_df.to_csv(s1_path, sep="\t", index=False)
+        s2_df.to_csv(s2_path, sep="\t", index=False)
+        s3_df.to_csv(s3_path, sep="\t", index=False)
+
+        for index, config in enumerate(candidate_configs):
+            output_path = temp_path / f"run_{index}"
+            result = CPPEngine.run_pipeline(
+                s1_path=s1_path,
+                s2_path=s2_path,
+                s3_path=s3_path,
+                output_dir=output_path,
+                rules=config,
+            )
+            predictions = load_tsv_mapping(output_path / "matching_results.tsv")
+            score, _ = compute_macro_f05(ground_truth, predictions, beta=0.5)
+            singleton_count = sum(1 for s1_id in ground_truth if not predictions.get(s1_id, set()))
+            candidate_count = result.get("total_candidates", 0)
+            scored = {
+                "macro_f05": score,
+                "singleton_count": singleton_count,
+                "candidate_count": candidate_count,
+                "config": config,
+            }
+            if not best_result or score > best_result["macro_f05"]:
+                best_result = scored
+
+    logger.info(
+        "Native C++ calibration selected Macro-F0.5=%.4f with config=%s",
+        best_result.get("macro_f05", 0.0), best_result.get("config", {}),
+    )
+    return best_result
 
 
 def load_target_records_by_ids(
     file_path: Path,
     target_ids_set: Set[str],
-    max_extra_distractors: int = 15000
+    max_extra_distractors: int = 100000
 ) -> List[Dict[str, str]]:
-    """Scan a target file (S2 or S3) and extract requested IDs plus random distractors."""
+    """Scan a target file and extract positives plus a deterministic distractor reservoir.
+
+    Taking the first N non-matches over-represents file-order artefacts. A
+    reservoir gives threshold tuning a much more representative hard-negative
+    population while retaining every labeled target ID.
+    """
     records: List[Dict[str, str]] = []
-    distractors_collected = 0
+    distractor_reservoir: List[Dict[str, str]] = []
+    distractors_seen = 0
+    rng = random.Random(42 + sum(file_path.name.encode("utf-8")))
     t0 = time.time()
 
     with open(file_path, "r", encoding="utf-8") as f:
@@ -66,22 +125,27 @@ def load_target_records_by_ids(
                     "business_address": addr,
                     "country": country
                 })
-            elif distractors_collected < max_extra_distractors:
-                # Add as negative distractor
-                records.append({
+            else:
+                distractor = {
                     "entity_id": eid,
                     "business_name": name,
                     "business_address": addr,
                     "country": country
-                })
-                distractors_collected += 1
+                }
+                distractors_seen += 1
+                if len(distractor_reservoir) < max_extra_distractors:
+                    distractor_reservoir.append(distractor)
+                else:
+                    replacement = rng.randrange(distractors_seen)
+                    if replacement < max_extra_distractors:
+                        distractor_reservoir[replacement] = distractor
 
     logger.info(
         "Scanned %s in %.2fs: extracted %d records (%d target matches, %d distractors)",
         file_path.name, time.time() - t0, len(records),
-        len(records) - distractors_collected, distractors_collected
+        len(records), len(distractor_reservoir)
     )
-    return records
+    return records + distractor_reservoir
 
 
 def evaluate_blocking_recall(
@@ -200,8 +264,8 @@ def run_training_and_validation(
 
     # Extract target records from S2 and S3
     logger.info("Extracting target records from Source 2 and Source 3...")
-    s2_records = load_target_records_by_ids(s2_path, needed_target_ids, max_extra_distractors=15000)
-    s3_records = load_target_records_by_ids(s3_path, needed_target_ids, max_extra_distractors=15000)
+    s2_records = load_target_records_by_ids(s2_path, needed_target_ids, max_extra_distractors=100000)
+    s3_records = load_target_records_by_ids(s3_path, needed_target_ids, max_extra_distractors=100000)
 
     s2_df = pd.DataFrame(s2_records)
     s3_df = pd.DataFrame(s3_records)
@@ -221,7 +285,8 @@ def run_training_and_validation(
     logger.info("=" * 70)
     blocker = CountryPartitionedBlocker(DEFAULT_CONFIG.blocking)
     train_c_dict, train_c_df = blocker.generate_candidates(train_s1_p, s2_p, s3_p)
-    evaluate_blocking_recall(train_c_dict, gt_map, train_s1_ids, split_name="Training")
+    train_gt = {s1_id: gt_map.get(s1_id, set()) for s1_id in train_s1_ids}
+    evaluate_blocking_recall(train_c_dict, train_gt, train_s1_ids, split_name="Training")
 
     # Feature extraction & Model Training
     logger.info("=" * 70)
@@ -229,7 +294,7 @@ def run_training_and_validation(
     logger.info("=" * 70)
     trainer = MatcherTrainer(DEFAULT_CONFIG.train)
     matcher, opt_threshold, cv_f05 = trainer.train_and_evaluate(
-        train_c_df, gt_map, train_s1_p, target_p
+        train_c_df, train_gt, train_s1_p, target_p
     )
 
     logger.info("Model training complete! Optimal threshold: %.3f (CV Macro-F0.5: %.4f)", opt_threshold, cv_f05)
@@ -308,6 +373,33 @@ def run_training_and_validation(
     non_singleton_scores = [per_entity_scores[s1_id] for s1_id in val_non_singletons]
     non_singleton_mean = sum(non_singleton_scores) / max(1, len(non_singleton_scores))
 
+    native_configs = [
+        {
+            "match_threshold": threshold,
+            "min_candidate_score": min_score,
+            "street_num_bonus": 0.15,
+            "street_num_penalty": -0.5,
+            "postal_bonus": 0.15,
+            "postal_penalty": -0.5,
+            "addr_bonus": 0.15,
+            "addr_penalty": -0.5,
+            "max_candidates_per_entity": 30,
+            "max_matches_per_entity": max_matches,
+            "max_posting_list_size": 1000,
+            "num_threads": 8,
+        }
+        for threshold in (0.80, 0.82, 0.85)
+        for min_score in (0.35, 0.45)
+        for max_matches in (11, 12)
+    ]
+    native_calibration = calibrate_cpp_rules(
+        val_s1_df,
+        s2_df,
+        s3_df,
+        val_gt,
+        native_configs,
+    )
+
     logger.info("=" * 70)
     logger.info("VALIDATION RESULTS SUMMARY ON REAL CHALLENGE DATA:")
     logger.info("  Total Validation Entities: %d", len(val_s1_ids))
@@ -319,18 +411,20 @@ def run_training_and_validation(
     logger.info("=" * 70)
 
     # Finalized validated execution config
-    exec_config = {
-        "match_threshold": round(opt_threshold, 3),
+    exec_config = native_calibration.get("config", {
+        "match_threshold": 0.80,
         "min_candidate_score": 0.35,
         "street_num_bonus": 0.15,
-        "street_num_penalty": -0.35,
+        "street_num_penalty": -0.5,
         "postal_bonus": 0.15,
-        "postal_penalty": -0.35,
+        "postal_penalty": -0.5,
         "addr_bonus": 0.15,
-        "addr_penalty": -0.35,
-        "max_candidates_per_entity": 10,
-        "num_threads": 8
-    }
+        "addr_penalty": -0.5,
+        "max_candidates_per_entity": 30,
+        "max_matches_per_entity": 12,
+        "max_posting_list_size": 1000,
+        "num_threads": 8,
+    })
 
     # Save winning threshold config artifact with verified parameters
     config_path = DEFAULT_CONFIG.paths.threshold_config_file
@@ -339,6 +433,7 @@ def run_training_and_validation(
             "optimal_threshold": opt_threshold,
             "macro_f05_val": macro_f05,
             "macro_f05_cv": cv_f05,
+            "native_macro_f05_val": native_calibration.get("macro_f05"),
             "singleton_rate": pred_singleton_rate,
             "true_singleton_rate": val_true_singleton_rate,
             "target_blocking_recall": val_blocking["target_blocking_recall"],

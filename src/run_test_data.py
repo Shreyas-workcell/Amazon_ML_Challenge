@@ -49,7 +49,7 @@ def extract_search_tokens(text: str) -> List[str]:
 def run_full_test_inference(
     test_dir: Path,
     output_dir: Path,
-    match_threshold: float = 0.55
+    match_threshold: float = 0.80
 ) -> Tuple[Path, Path]:
     """
     Execute large-scale inference over test dataset.
@@ -103,7 +103,7 @@ def run_full_test_inference(
 def run_full_test_inference_python(
     test_dir: Path,
     output_dir: Path,
-    match_threshold: float = 0.55
+    match_threshold: float = 0.80
 ) -> Tuple[Path, Path]:
     """Fallback pure-Python streaming inference."""
     t_start = time.time()
@@ -335,4 +335,4 @@ def run_full_test_inference_python(
 if __name__ == "__main__":
     test_directory = Path("data/student_resource/dataset/test")
     output_directory = Path("output")
-    run_full_test_inference(test_directory, output_directory, match_threshold=0.55)
+    run_full_test_inference(test_directory, output_directory, match_threshold=0.80)

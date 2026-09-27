@@ -217,6 +217,26 @@ class TestEndToEndPipeline(unittest.TestCase):
                     matches_val = row[1] if len(row) > 1 else ""
                     self.assertEqual(matches_val.strip(), "", "Singleton S1-105 must have no matched links")
 
+    def test_phone_blocking_recovers_name_mismatch(self) -> None:
+        s1 = pd.DataFrame([{
+            "entity_id": "S1-1", "name": "Reference Business", "address": "1 Main St",
+            "country": "US", "phone": "555-0100"
+        }])
+        s2 = pd.DataFrame([{
+            "entity_id": "S2-1", "name": "Different Trading Name", "address": "9 Other Rd",
+            "country": "US", "phone": "(555) 0100"
+        }])
+        s3 = pd.DataFrame(columns=s2.columns)
+        prep = RecordPreprocessor(DEFAULT_CONFIG.columns)
+        s1_p = prep.process_dataframe(s1, source_prefix="S1")
+        s2_p = prep.process_dataframe(s2, source_prefix="S2")
+        s3_p = prep.process_dataframe(s3, source_prefix="S3")
+
+        candidate_dict, _ = CountryPartitionedBlocker(DEFAULT_CONFIG.blocking).generate_candidates(
+            s1_p, s2_p, s3_p
+        )
+        self.assertIn("S2-1", candidate_dict["S1-1"])
+
 
 if __name__ == "__main__":
     unittest.main()

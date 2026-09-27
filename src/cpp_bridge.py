@@ -176,7 +176,7 @@ class CPPEngine:
         match_out_p = str(out_d / "matching_results.tsv")
 
         rules_dict = {
-            "match_threshold": 0.55,
+            "match_threshold": 0.80,
             "min_candidate_score": 0.35,
             "street_num_bonus": 0.15,
             "street_num_penalty": -0.35,
@@ -184,7 +184,9 @@ class CPPEngine:
             "postal_penalty": -0.35,
             "addr_bonus": 0.15,
             "addr_penalty": -0.35,
-            "max_candidates_per_entity": 10,
+            "max_candidates_per_entity": 30,
+            "max_matches_per_entity": 12,
+            "max_posting_list_size": 1000,
             "num_threads": 8
         }
         if rules:
