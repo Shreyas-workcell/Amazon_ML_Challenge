@@ -292,12 +292,16 @@ def main() -> None:
     # PHASE 4: Comprehensive TSV Report Generation
     # =========================================================================
     print_banner("PHASE 4: TSV REPORT GENERATION")
-    report_file = output_path / "resolution_report.tsv"
+    reports_dir = PROJECT_ROOT / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_file = reports_dir / "resolution_report.tsv"
     report_rows = [
         ("metric", "value", "category", "details"),
         ("pipeline_status", "SUCCESS", "Execution", "Completed without errors"),
         ("python_version", sys.version.split()[0], "Environment", "Python 3.13 venv"),
         ("total_s1_records", str(total_s1), "Dataset", "Source 1 test entities"),
+        ("total_s2_records", str(cpp_res.get('total_s2', 0)), "Dataset", "Source 2 target entities"),
+        ("total_s3_records", str(cpp_res.get('total_s3', 0)), "Dataset", "Source 3 target entities"),
         ("total_candidates_generated", str(cpp_res.get('total_candidates', 0)), "Candidate Generation", "Blocking stage candidate pairs"),
         ("total_matches_resolved", str(cpp_res.get('total_matches', 0)), "Entity Resolution", "Matching target entity links"),
         ("singletons_count", str(singletons), "Singleton Analysis", "Entities with zero matching targets"),

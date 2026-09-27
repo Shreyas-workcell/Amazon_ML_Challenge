@@ -414,6 +414,8 @@ class BusinessEntityResolutionAgent:
             summary = {
                 "mode": "streaming",
                 "total_s1_records": total_s1,
+                "total_s2_records": self.resource_mgr.resources["s2"].record_count,
+                "total_s3_records": self.resource_mgr.resources["s3"].record_count,
                 "candidate_pairs_count": sum(len(v) for v in cands.values()),
                 "matched_links_count": sum(len(v) for v in matches.values()),
                 "candidate_file": str(cand_p),
@@ -587,9 +589,11 @@ class BusinessEntityResolutionAgent:
             ("timestamp", time.strftime("%Y-%m-%d %H:%M:%S"), "Execution", "Completion timestamp"),
             ("decision_threshold", str(self.pipeline.decision_threshold), "Model Configuration", "Tuned Macro-F0.5 threshold"),
             ("blocking_top_k", str(self.config.blocking.lexical_top_k + self.config.blocking.dense_top_k), "Candidate Generation", "Total top-k candidate budget"),
-            ("total_s1_records", str(exec_summary.get("total_s1", len(self.last_results) if hasattr(self, "last_results") and self.last_results else 0)), "Dataset", "Source 1 reference entities"),
-            ("total_matches_resolved", str(exec_summary.get("total_matches", 0)), "Entity Resolution", "Resolved target entity links"),
-            ("singletons_count", str(exec_summary.get("singletons", 0)), "Singleton Analysis", "Zero-match reference entities"),
+            ("total_s1_records", str(exec_summary.get("total_s1_records", 0)), "Dataset", "Source 1 reference entities"),
+            ("total_s2_records", str(exec_summary.get("total_s2_records", 0)), "Dataset", "Source 2 target entities"),
+            ("total_s3_records", str(exec_summary.get("total_s3_records", 0)), "Dataset", "Source 3 target entities"),
+            ("total_matches_resolved", str(exec_summary.get("matched_links_count", 0)), "Entity Resolution", "Resolved target entity links"),
+            ("singletons_count", str(exec_summary.get("singletons_count", 0)), "Singleton Analysis", "Zero-match reference entities"),
             ("validation_submission_check", "PASS", "Submission Validation", "Strictly formatted TSV outputs"),
             ("output_data_sorted", "TRUE", "Data Formatting", "Strictly sorted by source1_entity_id, canonical target ID ordering"),
         ]

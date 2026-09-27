@@ -110,6 +110,8 @@ class TestCPPAndVisualization(unittest.TestCase):
 
         self.assertEqual(summary["status"], "success")
         self.assertEqual(summary["total_s1"], 5)
+        self.assertEqual(summary["total_s2"], 3)
+        self.assertEqual(summary["total_s3"], 2)
         self.assertGreater(summary["total_candidates"], 0)
         self.assertGreater(summary["total_matches"], 0)
         self.assertEqual(summary["singletons"], 1)

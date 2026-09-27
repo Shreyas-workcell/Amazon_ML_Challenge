@@ -63,10 +63,10 @@ def run_entity_resolution(
     Execute end-to-end tripartite entity resolution pipeline.
     Serializes candidate_pairs.tsv and matching_results.tsv to output_dir.
     """
+    if not s2_path or not s3_path:
+        raise ValueError("Both s2_path and s3_path are required; resolution must use all three sources.")
     agent = BusinessEntityResolutionAgent()
-    s2 = s2_path or s1_path
-    s3 = s3_path or s1_path
-    agent.ingest_resources(s1=s1_path, s2=s2, s3=s3, ground_truth=ground_truth_path)
+    agent.ingest_resources(s1=s1_path, s2=s2_path, s3=s3_path, ground_truth=ground_truth_path)
     summary = agent.resolve(output_dir=output_dir, mode=mode)
     if agent.ground_truth_data:
         eval_report = agent.evaluate()

@@ -78,8 +78,16 @@ def main() -> None:
 
     agent = BusinessEntityResolutionAgent()
 
+    def target_paths_or_error() -> tuple[str, str]:
+        if args.s2 and args.s3:
+            return args.s2, args.s3
+        if Path(args.s1).is_dir():
+            raise ValueError("Dataset directory must contain Source 1, Source 2, and Source 3 files.")
+        raise ValueError("Both --s2 and --s3 are required; resolution must use all three sources.")
+
     if args.command == "resolve":
-        agent.ingest_resources(s1=args.s1, s2=args.s2 or args.s1, s3=args.s3 or args.s1, ground_truth=args.ground_truth)
+        s2, s3 = target_paths_or_error()
+        agent.ingest_resources(s1=args.s1, s2=s2, s3=s3, ground_truth=args.ground_truth)
         summary = agent.resolve(output_dir=args.output_dir, mode=args.mode)
         if agent.ground_truth_data:
             eval_res = agent.evaluate()
@@ -90,13 +98,15 @@ def main() -> None:
         print(json.dumps(summary, indent=2, default=str))
 
     elif args.command == "visualize":
-        agent.ingest_resources(s1=args.s1, s2=args.s2 or args.s1, s3=args.s3 or args.s1)
+        s2, s3 = target_paths_or_error()
+        agent.ingest_resources(s1=args.s1, s2=s2, s3=s3)
         agent.resolve()
         img_path = agent.visualize_graph(output_path=args.img_out)
         print(json.dumps({"status": "visualized", "image_path": str(img_path)}, indent=2))
 
     elif args.command == "inspect":
-        agent.ingest_resources(s1=args.s1, s2=args.s2 or args.s1, s3=args.s3 or args.s1)
+        s2, s3 = target_paths_or_error()
+        agent.ingest_resources(s1=args.s1, s2=s2, s3=s3)
         report = agent.inspect_resources()
         print(json.dumps(report, indent=2, default=str))
 
@@ -110,7 +120,8 @@ def main() -> None:
         print(json.dumps(res, indent=2, default=str))
 
     elif args.command == "query":
-        agent.ingest_resources(s1=args.s1, s2=args.s2 or args.s1, s3=args.s3 or args.s1)
+        s2, s3 = target_paths_or_error()
+        agent.ingest_resources(s1=args.s1, s2=s2, s3=s3)
         agent.resolve()
         res = agent.query_entity(s1_id=args.s1_id)
         print(json.dumps(res, indent=2, default=str))

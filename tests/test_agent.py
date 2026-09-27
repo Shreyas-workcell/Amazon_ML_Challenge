@@ -153,6 +153,18 @@ class TestBusinessEntityResolutionAgent(unittest.TestCase):
         report_file = agent.export_summary_report(self.work_dir / "report.json")
         self.assertTrue(report_file.exists())
 
+        tsv_report = agent.export_tsv_report(self.work_dir / "resolution_report.tsv")
+        report_rows = {}
+        with open(tsv_report, encoding="utf-8") as f:
+            for line in f:
+                fields = line.rstrip("\n").split("\t")
+                if fields[0] != "metric":
+                    report_rows[fields[0]] = fields[1]
+        self.assertEqual(report_rows["total_s1_records"], "2")
+        self.assertEqual(report_rows["total_s2_records"], "2")
+        self.assertEqual(report_rows["total_s3_records"], "1")
+        self.assertEqual(report_rows["total_matches_resolved"], str(res_summary["matched_links_count"]))
+
     def test_directory_auto_discovery(self) -> None:
         """Verify directory discovery when single path is passed."""
         mgr = DataResourceManager()

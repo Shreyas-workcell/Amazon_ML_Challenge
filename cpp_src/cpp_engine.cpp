@@ -666,6 +666,8 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
 
     // Step 2: Index S2 and S3 in a SINGLE PASS into country-partitioned indexes
     std::unordered_map<std::string, CountryTargetIndex> country_target_indices;
+    size_t total_s2 = 0;
+    size_t total_s3 = 0;
     for (const auto& cp : s1_by_country) {
         country_target_indices[cp.first].records.reserve(1000000);
     }
@@ -679,6 +681,11 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
         std::getline(tgt_file, t_line); // Skip header
         while (std::getline(tgt_file, t_line)) {
             if (t_line.empty()) continue;
+            if (src_type == 2) {
+                total_s2++;
+            } else {
+                total_s3++;
+            }
             split_tsv_fields(t_line, fields);
             if (fields.empty()) continue;
 
@@ -1229,6 +1236,8 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
     json_ss << "{"
             << "\"status\": \"success\","
             << "\"total_s1\": " << total_s1 << ","
+            << "\"total_s2\": " << total_s2 << ","
+            << "\"total_s3\": " << total_s3 << ","
             << "\"total_candidates\": " << total_cand_links << ","
             << "\"total_matches\": " << total_matched_links << ","
             << "\"singletons\": " << singletons_count << ","
